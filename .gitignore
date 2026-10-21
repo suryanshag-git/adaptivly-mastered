@@ -23,6 +23,8 @@ pnpm-debug.log*
 .cache/
 .vite/
 .eslintcache
+__pycache__/
+*.pkl
 
 # IDE
 .vscode/
