@@ -49,7 +49,7 @@ import joblib
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-DATASET_NAME = "IBM/ProjectCodeNet"  # HuggingFace mirror of CodeNet
+DATASET_NAME = "petersa2/CodeNet"  # Updated to community CodeNet subset
 DATA_SPLIT = "train"  # the full split contains all submissions
 MODEL_PATH = Path(__file__).with_name("adaptive_model.pkl")
 RANDOM_STATE = 42
