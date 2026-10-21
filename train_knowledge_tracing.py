@@ -58,24 +58,146 @@ RANDOM_STATE = 42
 # Helper utilities
 # ---------------------------------------------------------------------------
 
-def load_codenet() -> pd.DataFrame:
-    """Load Project CodeNet and return a DataFrame with a small subset of columns.
+def load_hybrid() -> pd.DataFrame:
+    """Load a hybrid dataset that combines telemetry from Codeforces submissions
+    with educational metadata from a CSEDM‑style dataset.
 
-    The HuggingFace version contains the following useful fields (among others):
-        - ``submission_id``
-        - ``problem_id``
-        - ``user_id`` (anonymised student identifier)
-        - ``verdict`` (e.g. "Accepted", "Wrong Answer", ...)
-        - ``runtime`` (seconds as float)
-        - ``difficulty`` (categorical: "Easy", "Medium", "Hard")
+    * **Codeforces (telemetry)** – provides per‑submission ``verdict``, ``timeConsumedMillis``
+      (runtime), and ``problem_rating`` (numeric difficulty). These fields map directly
+      to the ``verdict``, ``runtime`` and ``difficulty`` columns required by the rest of the
+      pipeline.
+    * **CSEDM (educational context)** – typically contains student‑level interaction
+      details (e.g., prior accuracy, problem tags). Because a public HF mirror is not
+      readily available, we attempt to load a community fork ``CSEDM/education``; if that
+      fails we fall back to a local CSV file ``data/csedm.csv`` that the user can place in
+      the repository.
 
-    For the purpose of the demo we keep only the columns needed for feature
-    engineering.  The function returns a ``pandas.DataFrame`` sorted by
-    ``user_id`` and ``submission_id`` (chronological order).
+    The two tables are merged on ``user_id`` and ``problem_id`` (a reasonable proxy for
+    a student attempting the same problem). Missing educational fields are filled with
+    defaults so that the downstream feature engineering works unchanged.
     """
-    ds = load_dataset(DATASET_NAME, split=DATA_SPLIT)
-    df = pd.DataFrame(ds)
-    # Keep only necessary columns and rename for clarity
+    # ------------------- Load Codeforces telemetry -------------------
+    cf = load_dataset("open-r1/codeforces-submissions", split="train")
+    cf_df = pd.DataFrame(cf)
+
+    # Normalise column names to the schema expected later.
+    col_map = {
+        "submission_id": "submission_id",
+        "id": "submission_id",
+        "problem_id": "problem_id",
+        "contest_id": "problem_id",
+        "user_id": "user_id",
+        "handle": "user_id",
+        "verdict": "verdict",
+        "result": "verdict",
+        "timeConsumedMillis": "runtime_ms",
+        "time": "runtime_ms",
+        "problem_rating": "problem_rating",
+        "difficulty": "difficulty",
+    }
+    existing = {src: dst for src, dst in col_map.items() if src in cf_df.columns}
+    cf_df = cf_df.rename(columns=existing)
+
+    # Required columns check
+    for req in ["submission_id", "problem_id", "user_id", "verdict", "runtime_ms"]:
+        if req not in cf_df.columns:
+            raise KeyError(f"Required column '{req}' not found in Codeforces dataset.")
+
+    # Convert runtime to seconds (original script expects seconds)
+    cf_df["runtime"] = cf_df["runtime_ms"].astype(float) / 1000.0
+
+    # Derive difficulty tier from problem_rating if present.
+    if "problem_rating" in cf_df.columns:
+        def rating_to_tier(r):
+            if r is None or pd.isna(r):
+                return -1
+            if r < 1200:
+                return 0
+            if r < 1800:
+                return 1
+            return 2
+        cf_df["difficulty"] = cf_df["problem_rating"].apply(rating_to_tier)
+    elif "difficulty" in cf_df.columns:
+        mapping = {"Easy": 0, "Medium": 1, "Hard": 2}
+        cf_df["difficulty"] = cf_df["difficulty"].map(mapping).fillna(-1).astype(int)
+    else:
+        cf_df["difficulty"] = 1  # default medium tier
+
+    # Keep only columns needed for downstream processing.
+    telemetry_cols = ["submission_id", "problem_id", "user_id", "verdict", "runtime", "difficulty"]
+    cf_df = cf_df[telemetry_cols]
+
+    # ------------------- Load CSEDM educational data -------------------
+    try:
+        edu = load_dataset("CSEDM/education", split="train")
+        edu_df = pd.DataFrame(edu)
+    except Exception:
+        # Fallback to a local CSV; users can place a CSV file at ./data/csedm.csv.
+        csv_path = Path(__file__).parent / "data" / "csedm.csv"
+        if csv_path.is_file():
+            edu_df = pd.read_csv(csv_path)
+        else:
+            edu_df = pd.DataFrame()  # empty DataFrame – merge will be a no‑op.
+
+    # If the educational dataset has different column names, normalise them.
+    # Expected columns: user_id, problem_id, past_accuracy, avg_runtime_ms, current_difficulty
+    # (any missing column will be filled later with defaults).
+    # No explicit renaming is performed here; we assume the dataset already follows this schema.
+
+    # ------------------- Merge telemetry with education -------------------
+    if not edu_df.empty:
+        merged = cf_df.merge(
+            edu_df,
+            on=["user_id", "problem_id"],
+            how="left",
+            suffixes=("", "_edu"),
+        )
+    else:
+        merged = cf_df.copy()
+
+    # Fill missing educational fields with sensible defaults so that later code works.
+    for col, default in {
+        "past_accuracy": 0.0,
+        "avg_runtime_ms": merged.get("runtime", 0.0) * 1000.0,
+        "current_difficulty": merged["difficulty"],
+    }.items():
+        if col not in merged.columns:
+            merged[col] = default
+        else:
+            merged[col] = merged[col].fillna(default)
+
+    # Ensure chronological order per student.
+    merged = merged.sort_values(["user_id", "submission_id"]).reset_index(drop=True)
+    return merged
+
+def load_codenet() -> pd.DataFrame:
+    """Load Project CodeNet dataset.
+
+    Attempts to download the dataset from HuggingFace. If that fails, it falls back
+    to a local CSV file at ``./data/codenet.csv``. If the CSV is also missing, a
+    small synthetic dataset is generated so the script can still run for demo
+    purposes.
+    """
+    try:
+        ds = load_dataset(DATASET_NAME, split=DATA_SPLIT)
+        df = pd.DataFrame(ds)
+    except Exception as e_remote:
+        # Fallback to local CSV
+        fallback_path = Path(__file__).parent / "data" / "codenet.csv"
+        if fallback_path.is_file():
+            df = pd.read_csv(fallback_path)
+        else:
+            # Create a tiny synthetic dataset (3 students, 2 submissions each)
+            synthetic = {
+                "submission_id": [1, 2, 3, 4, 5, 6],
+                "problem_id": [101, 102, 101, 103, 102, 104],
+                "user_id": ["u1", "u1", "u2", "u2", "u3", "u3"],
+                "verdict": ["Accepted", "Wrong Answer", "Accepted", "Accepted", "Wrong Answer", "Accepted"],
+                "runtime": [0.5, 0.8, 0.6, 0.7, 1.0, 0.9],
+                "difficulty": ["Easy", "Medium", "Easy", "Hard", "Medium", "Hard"],
+            }
+            df = pd.DataFrame(synthetic)
+            print("[INFO] Using synthetic fallback dataset (no real data available).")
     required = [
         "submission_id",
         "problem_id",
@@ -84,8 +206,10 @@ def load_codenet() -> pd.DataFrame:
         "runtime",
         "difficulty",
     ]
+    missing = set(required) - set(df.columns)
+    if missing:
+        raise KeyError(f"Missing required columns in CodeNet data: {missing}")
     df = df[required]
-    # Ensure chronological order (submission_id is monotonic per user)
     df = df.sort_values(["user_id", "submission_id"]).reset_index(drop=True)
     return df
 
