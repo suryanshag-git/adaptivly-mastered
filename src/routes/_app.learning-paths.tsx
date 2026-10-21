@@ -80,9 +80,9 @@ function LearningPaths() {
 
     supabaseBrowser
       .from("user_problem_status")
-      .select("id", { count: "exact" })
+      .select("problem_id", { count: "exact" })
       .eq("user_id", user.id)
-      .eq("status", "solved")
+      .eq("solved", true)
       .then(({ count }) => {
         setSolvedCount(count ?? 0);
       });

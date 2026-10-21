@@ -99,8 +99,8 @@ function Dashboard() {
             supabaseBrowser.from("user_achievements").select("id", { count: "exact" }).eq("user_id", user!.id),
             supabaseBrowser.from("submissions").select("id", { count: "exact" })
               .eq("user_id", user!.id).gte("submitted_at", today),
-            supabaseBrowser.from("user_problem_status").select("id", { count: "exact" })
-              .eq("user_id", user!.id).eq("status", "solved"),
+            supabaseBrowser.from("user_problem_status").select("problem_id", { count: "exact" })
+              .eq("user_id", user!.id).eq("solved", true),
             supabaseBrowser.from("planner_tasks").select("*")
               .eq("user_id", user!.id).gte("scheduled_at", today).lte("scheduled_at", today + "T23:59:59"),
             supabaseBrowser.from("submissions").select("submitted_at")

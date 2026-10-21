@@ -1,62 +1,92 @@
 // src/server-actions/adaptive-dashboard.ts
-// Client‑side stub that runs entirely on the server via a server action.
-// All server‑only imports are performed **inside** the handler to avoid
-// import‑protection in the client bundle.
+// Server function that generates adaptive recommendations for the dashboard.
+// Uses createServerFn so it always runs on the server — never bundled into client code.
 
-import { createServerAction } from '@/lib/server-actions';
+import { createServerFn } from '@tanstack/react-start';
+import { z } from 'zod';
 
-// Server action: getAdaptiveRecommendation
-export const getAdaptiveRecommendation = createServerAction(async (userId: string) => {
-  // Import the privileged Supabase client only on the server.
-  const { supabase } = await import('@/server/db');
+const tokenSchema = z.object({ token: z.string() });
 
-  // ---------------------------------------------------------------------
-  // Helper: compute live telemetry for a given user from Supabase submissions
-  // ---------------------------------------------------------------------
-  const { data, error } = await supabase
-    .from('submissions')
-    .select('verdict,runtime,difficulty')
-    .eq('user_id', userId);
+/** Returns weak topics, revision topic, flashcard deck, quiz topic, and today's learning step. */
+export const getAdaptiveRecommendations = createServerFn({ method: 'GET' })
+  .validator((data: unknown) => tokenSchema.parse(data))
+  .handler(async ({ data }) => {
+    const { requireUserId } = await import('@/server/auth');
+    const { supabase } = await import('@/server/db');
 
-  if (error) throw new Error(`Supabase error: ${error.message}`);
+    const userId = await requireUserId(data.token);
 
-  if (!data || data.length === 0) {
-    return { tier: 1 } as const; // default tier if no data
-  }
+    // ── Fetch all user submissions with topic + difficulty ────────────────────
+    const { data: subs } = await supabase
+      .from('submissions')
+      .select('status, runtime_ms, created_at, problems(topic, difficulty)')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false });
 
-  // Exclude the most recent submission when computing past statistics
-  const past = data.slice(0, -1);
-  const correct = past.filter((s: any) => s.verdict === 'Accepted').length;
-  const past_accuracy = past.length ? correct / past.length : 0;
+    // ── Aggregate by topic ────────────────────────────────────────────────────
+    const topicMap: Record<string, { total: number; accepted: number; lastDate: string }> = {};
+    for (const s of subs ?? []) {
+      const topic = (s as any).problems?.topic ?? 'General';
+      if (!topicMap[topic]) topicMap[topic] = { total: 0, accepted: 0, lastDate: s.created_at };
+      topicMap[topic].total++;
+      if (s.status === 'Accepted') topicMap[topic].accepted++;
+    }
 
-  const totalRuntime = past.reduce((sum: number, s: any) => sum + Number(s.runtime) * 1000, 0);
-  const avg_runtime_ms = past.length ? totalRuntime / past.length : 0;
+    // ── Weak topics (<60% accuracy, at least 1 attempt) ──────────────────────
+    const weakTopics = Object.entries(topicMap)
+      .map(([name, v]) => ({ name, score: Math.round((v.accepted / v.total) * 100) }))
+      .filter(t => t.score < 60)
+      .sort((a, b) => a.score - b.score)
+      .slice(0, 3);
 
-  const last = data[data.length - 1];
-  const diffMap: Record<string, number> = { Easy: 0, Medium: 1, Hard: 2 };
-  const current_difficulty = diffMap[last.difficulty] ?? 0;
+    // ── Spaced-revision topic (longest since last practice) ───────────────────
+    const revisionEntry = Object.entries(topicMap)
+      .filter(([, v]) => v.total > 0)
+      .sort(([, a], [, b]) => new Date(a.lastDate).getTime() - new Date(b.lastDate).getTime())[0];
 
-  const telemetry = { past_accuracy, avg_runtime_ms, current_difficulty };
+    const revisionTopic = revisionEntry?.[0] ?? 'Dynamic Programming';
+    const revisionDays = revisionEntry
+      ? Math.floor((Date.now() - new Date(revisionEntry[1].lastDate).getTime()) / 86400000)
+      : 7;
 
-  // ---------------------------------------------------------------------
-  // Call the FastAPI gateway (assumes it runs locally on port 8000)
-  // ---------------------------------------------------------------------
-  const res = await fetch('http://localhost:8000/predict', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(telemetry),
+    // ── Recommended next problem topic (weakest area) ─────────────────────────
+    const focusTopic = weakTopics[0]?.name ?? revisionTopic;
+
+    // ── Today's learning step ─────────────────────────────────────────────────
+    const pathMap: Record<string, string> = {
+      Arrays: '/practice',
+      Graphs: '/practice',
+      'Dynamic Programming': '/practice',
+      'System Design': '/subjects',
+      Web: '/subjects',
+      ML: '/subjects',
+    };
+
+    const todaysLearning = {
+      topic: `Practice: ${focusTopic}`,
+      path: pathMap[focusTopic] ?? '/practice',
+    };
+
+    const todaysRevision = {
+      topic: revisionTopic,
+      daysSinceReview: revisionDays,
+      path: '/practice',
+      actionLabel: `Review ${revisionTopic} →`,
+    };
+
+    const todaysFlashcards = {
+      deckName: `${focusTopic} Flashcards`,
+      cardCount: 10,
+      path: '/flashcards',
+    };
+
+    const todaysQuiz = {
+      topic: focusTopic,
+      path: '/assessment',
+    };
+
+    return { weakTopics, todaysLearning, todaysRevision, todaysFlashcards, todaysQuiz };
   });
 
-  if (!res.ok) {
-    const txt = await res.text();
-    throw new Error(`ML service error (${res.status}): ${txt}`);
-  }
-
-  const { recommended_difficulty } = (await res.json()) as { recommended_difficulty: number };
-
-  // Return result for downstream Gemini integration.
-  return { tier: recommended_difficulty } as const;
-});
-
-// Alias to keep existing imports working.
-export const getAdaptiveRecommendations = getAdaptiveRecommendation;
+// Alias kept for backwards compat with any old imports
+export const getAdaptiveRecommendation = getAdaptiveRecommendations;
