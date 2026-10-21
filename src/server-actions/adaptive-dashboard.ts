@@ -1,6 +1,6 @@
 import { createServerAction } from '@/lib/server-actions';
 import { supabaseAdmin } from '@/lib/supabase-admin';
-import { fetch } from 'undici'; // node fetch compatible
+// Using the native global fetch (Node 18+). No external dependency required.
 
 // ---------------------------------------------------------------------------
 // Helper: compute live telemetry for a given user from Supabase submissions
