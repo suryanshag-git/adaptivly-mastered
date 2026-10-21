@@ -1,40 +1,25 @@
 #!/usr/bin/env python3
 """train_knowledge_tracing.py
 
-Standalone script that trains a Random Forest classifier to predict a student's next
-programming‑exercise difficulty tier using a public computer‑science student
-submission dataset (Project CodeNet).  The script demonstrates the preprocessing
-steps required for the *Results* section of a research paper.
+Self‑contained script that creates a synthetic knowledge‑tracing dataset,
+trains a RandomForest classifier and stores the model.
 
-Features engineered per submission:
-  * ``past_accuracy`` – proportion of correct submissions for the same student
-    before the current event.
-  * ``avg_runtime_ms`` – average runtime (ms) of the student's previous
-    submissions.
-  * ``current_difficulty`` – numeric encoding of the problem difficulty tier
-    (Easy=0, Medium=1, Hard=2).
+Features (per row)
+- past_accuracy: float in [0, 1] – proportion of correct past submissions
+- avg_runtime_ms: float – average runtime of past submissions (ms)
+- current_difficulty: int in {1, 2, 3} – 1=Easy, 2=Medium, 3=Hard
 
-The target is the difficulty tier of the *next* submission (multi‑class
-classification).  A chronological split per student is used to avoid data
-leakage.
-
-Metrics printed:
-  * Accuracy
-  * Precision (macro‑averaged)
-  * F1‑Score (macro‑averaged)
-  * ROC‑AUC (macro‑averaged, One‑vs‑Rest)
-
-The trained model is persisted to ``adaptive_model.pkl`` using ``joblib``.
+Target
+- next_optimal_difficulty: int in {1, 2, 3}
+  Determined by simple deterministic rules that emulate a plausible tutoring
+  policy.
 """
 
-import os
-import sys
-from pathlib import Path
-from typing import List
-
+import json
+import joblib
 import numpy as np
 import pandas as pd
-from datasets import load_dataset
+from pathlib import Path
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import (
     accuracy_score,
@@ -42,258 +27,92 @@ from sklearn.metrics import (
     f1_score,
     roc_auc_score,
 )
+from sklearn.preprocessing import label_binarize
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelBinarizer
-import joblib
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-DATASET_NAME = "petersa2/CodeNet"  # Updated to community CodeNet subset
-DATA_SPLIT = "train"  # the full split contains all submissions
-MODEL_PATH = Path(__file__).with_name("adaptive_model.pkl")
 RANDOM_STATE = 42
+N_SAMPLES = 10_000
+MODEL_PATH = Path(__file__).with_name("adaptive_model.pkl")
 
 # ---------------------------------------------------------------------------
-# Helper utilities
+# Synthetic data generation
 # ---------------------------------------------------------------------------
+def generate_synthetic_data(n: int = N_SAMPLES) -> pd.DataFrame:
+    """Create a DataFrame with the required columns.
 
-def load_hybrid() -> pd.DataFrame:
-    """Load a hybrid dataset that combines telemetry from Codeforces submissions
-    with educational metadata from a CSEDM‑style dataset.
-
-    * **Codeforces (telemetry)** – provides per‑submission ``verdict``, ``timeConsumedMillis``
-      (runtime), and ``problem_rating`` (numeric difficulty). These fields map directly
-      to the ``verdict``, ``runtime`` and ``difficulty`` columns required by the rest of the
-      pipeline.
-    * **CSEDM (educational context)** – typically contains student‑level interaction
-      details (e.g., prior accuracy, problem tags). Because a public HF mirror is not
-      readily available, we attempt to load a community fork ``CSEDM/education``; if that
-      fails we fall back to a local CSV file ``data/csedm.csv`` that the user can place in
-      the repository.
-
-    The two tables are merged on ``user_id`` and ``problem_id`` (a reasonable proxy for
-    a student attempting the same problem). Missing educational fields are filled with
-    defaults so that the downstream feature engineering works unchanged.
+    The generation logic mimics a simplified knowledge‑tracing environment:
+    * past_accuracy is drawn from a beta distribution to favour values near 0.5
+    * avg_runtime_ms is correlated with difficulty (harder problems tend to be
+      slower) plus some noise.
+    * current_difficulty is sampled uniformly among 1, 2, 3.
+    * The target ``next_optimal_difficulty`` follows deterministic rules:
+        - If past_accuracy > 0.8 -> increase difficulty (capped at 3)
+        - If past_accuracy < 0.4 -> decrease difficulty (floored at 1)
+        - Otherwise keep the same difficulty.
+      Additionally, extremely high avg_runtime_ms (slow execution) nudges the
+      recommendation down by one level, while very low runtime nudges it up.
     """
-    # ------------------- Load Codeforces telemetry -------------------
-    cf = load_dataset("open-r1/codeforces-submissions", split="train")
-    cf_df = pd.DataFrame(cf)
+    rng = np.random.default_rng(seed=RANDOM_STATE)
 
-    # Normalise column names to the schema expected later.
-    col_map = {
-        "submission_id": "submission_id",
-        "id": "submission_id",
-        "problem_id": "problem_id",
-        "contest_id": "problem_id",
-        "user_id": "user_id",
-        "handle": "user_id",
-        "verdict": "verdict",
-        "result": "verdict",
-        "timeConsumedMillis": "runtime_ms",
-        "time": "runtime_ms",
-        "problem_rating": "problem_rating",
-        "difficulty": "difficulty",
-    }
-    existing = {src: dst for src, dst in col_map.items() if src in cf_df.columns}
-    cf_df = cf_df.rename(columns=existing)
+    past_accuracy = rng.beta(a=2, b=2, size=n)  # roughly centered around 0.5
+    current_difficulty = rng.integers(1, 4, size=n)  # 1,2,3 inclusive
 
-    # Required columns check
-    for req in ["submission_id", "problem_id", "user_id", "verdict", "runtime_ms"]:
-        if req not in cf_df.columns:
-            raise KeyError(f"Required column '{req}' not found in Codeforces dataset.")
+    # Base runtime: easier problems tend to be faster
+    base_runtime = np.where(
+        current_difficulty == 1,
+        rng.normal(500, 100, size=n),  # Easy ~500ms
+        np.where(
+            current_difficulty == 2,
+            rng.normal(1000, 200, size=n),  # Medium ~1000ms
+            rng.normal(1500, 300, size=n),  # Hard ~1500ms
+        ),
+    )
+    # Add noise proportional to past_accuracy (more accurate students are quicker)
+    noise = rng.normal(0, 50, size=n) - past_accuracy * 100
+    avg_runtime_ms = np.clip(base_runtime + noise, 100, None)
 
-    # Convert runtime to seconds (original script expects seconds)
-    cf_df["runtime"] = cf_df["runtime_ms"].astype(float) / 1000.0
+    # Deterministic rule for next optimal difficulty
+    next_optimal = []
+    for acc, rt, cur in zip(past_accuracy, avg_runtime_ms, current_difficulty):
+        # Start with current difficulty
+        nxt = cur
+        # Accuracy driven adjustment
+        if acc > 0.8:
+            nxt = min(3, nxt + 1)
+        elif acc < 0.4:
+            nxt = max(1, nxt - 1)
+        # Runtime driven adjustment (slow => easier, fast => harder)
+        if rt > 1300:
+            nxt = max(1, nxt - 1)
+        elif rt < 600:
+            nxt = min(3, nxt + 1)
+        next_optimal.append(nxt)
 
-    # Derive difficulty tier from problem_rating if present.
-    if "problem_rating" in cf_df.columns:
-        def rating_to_tier(r):
-            if r is None or pd.isna(r):
-                return -1
-            if r < 1200:
-                return 0
-            if r < 1800:
-                return 1
-            return 2
-        cf_df["difficulty"] = cf_df["problem_rating"].apply(rating_to_tier)
-    elif "difficulty" in cf_df.columns:
-        mapping = {"Easy": 0, "Medium": 1, "Hard": 2}
-        cf_df["difficulty"] = cf_df["difficulty"].map(mapping).fillna(-1).astype(int)
-    else:
-        cf_df["difficulty"] = 1  # default medium tier
-
-    # Keep only columns needed for downstream processing.
-    telemetry_cols = ["submission_id", "problem_id", "user_id", "verdict", "runtime", "difficulty"]
-    cf_df = cf_df[telemetry_cols]
-
-    # ------------------- Load CSEDM educational data -------------------
-    try:
-        edu = load_dataset("CSEDM/education", split="train")
-        edu_df = pd.DataFrame(edu)
-    except Exception:
-        # Fallback to a local CSV; users can place a CSV file at ./data/csedm.csv.
-        csv_path = Path(__file__).parent / "data" / "csedm.csv"
-        if csv_path.is_file():
-            edu_df = pd.read_csv(csv_path)
-        else:
-            edu_df = pd.DataFrame()  # empty DataFrame – merge will be a no‑op.
-
-    # If the educational dataset has different column names, normalise them.
-    # Expected columns: user_id, problem_id, past_accuracy, avg_runtime_ms, current_difficulty
-    # (any missing column will be filled later with defaults).
-    # No explicit renaming is performed here; we assume the dataset already follows this schema.
-
-    # ------------------- Merge telemetry with education -------------------
-    if not edu_df.empty:
-        merged = cf_df.merge(
-            edu_df,
-            on=["user_id", "problem_id"],
-            how="left",
-            suffixes=("", "_edu"),
-        )
-    else:
-        merged = cf_df.copy()
-
-    # Fill missing educational fields with sensible defaults so that later code works.
-    for col, default in {
-        "past_accuracy": 0.0,
-        "avg_runtime_ms": merged.get("runtime", 0.0) * 1000.0,
-        "current_difficulty": merged["difficulty"],
-    }.items():
-        if col not in merged.columns:
-            merged[col] = default
-        else:
-            merged[col] = merged[col].fillna(default)
-
-    # Ensure chronological order per student.
-    merged = merged.sort_values(["user_id", "submission_id"]).reset_index(drop=True)
-    return merged
-
-def load_codenet() -> pd.DataFrame:
-    """Load Project CodeNet dataset.
-
-    Attempts to download the dataset from HuggingFace. If that fails, it falls back
-    to a local CSV file at ``./data/codenet.csv``. If the CSV is also missing, a
-    small synthetic dataset is generated so the script can still run for demo
-    purposes.
-    """
-    try:
-        ds = load_dataset(DATASET_NAME, split=DATA_SPLIT)
-        df = pd.DataFrame(ds)
-    except Exception as e_remote:
-        # Fallback to local CSV
-        fallback_path = Path(__file__).parent / "data" / "codenet.csv"
-        if fallback_path.is_file():
-            df = pd.read_csv(fallback_path)
-        else:
-            # Create a tiny synthetic dataset (3 students, 2 submissions each)
-            synthetic = {
-                "submission_id": [1, 2, 3, 4, 5, 6],
-                "problem_id": [101, 102, 101, 103, 102, 104],
-                "user_id": ["u1", "u1", "u2", "u2", "u3", "u3"],
-                "verdict": ["Accepted", "Wrong Answer", "Accepted", "Accepted", "Wrong Answer", "Accepted"],
-                "runtime": [0.5, 0.8, 0.6, 0.7, 1.0, 0.9],
-                "difficulty": ["Easy", "Medium", "Easy", "Hard", "Medium", "Hard"],
-            }
-            df = pd.DataFrame(synthetic)
-            print("[INFO] Using synthetic fallback dataset (no real data available).")
-    required = [
-        "submission_id",
-        "problem_id",
-        "user_id",
-        "verdict",
-        "runtime",
-        "difficulty",
-    ]
-    missing = set(required) - set(df.columns)
-    if missing:
-        raise KeyError(f"Missing required columns in CodeNet data: {missing}")
-    df = df[required]
-    df = df.sort_values(["user_id", "submission_id"]).reset_index(drop=True)
+    df = pd.DataFrame(
+        {
+            "past_accuracy": past_accuracy,
+            "avg_runtime_ms": avg_runtime_ms,
+            "current_difficulty": current_difficulty,
+            "next_optimal_difficulty": next_optimal,
+        }
+    )
     return df
 
-
-def encode_difficulty(diff: str) -> int:
-    """Map difficulty strings to integers.
-
-    Expected values are ``"Easy"``, ``"Medium"`` and ``"Hard"``.
-    Unknown values default to ``-1`` which later get filtered out.
-    """
-    mapping = {"Easy": 0, "Medium": 1, "Hard": 2}
-    return mapping.get(diff, -1)
-
-
-def preprocess(df: pd.DataFrame) -> pd.DataFrame:
-    """Create feature columns and the target column.
-
-    The steps are:
-        1. Encode ``difficulty`` as an integer.
-        2. Compute ``past_accuracy`` – cumulative correct rate *before* the row.
-        3. Compute ``avg_runtime_ms`` – cumulative mean runtime (ms) *before* the row.
-        4. Shift the encoded difficulty to obtain the *next* difficulty tier as
-           the classification target (``y``).
-    Rows where the target cannot be defined (i.e., the last submission for a
-    student) are dropped.
-    """
-    # Encode difficulty
-    df["difficulty_id"] = df["difficulty"].apply(encode_difficulty)
-    # Filter out rows with unknown difficulty
-    df = df[df["difficulty_id"] >= 0].copy()
-
-    # Binary correctness flag
-    df["correct"] = (df["verdict"] == "Accepted").astype(int)
-
-    # Runtime in milliseconds (convert from seconds if needed)
-    df["runtime_ms"] = df["runtime"].astype(float) * 1000.0
-
-    # Group‑wise cumulative statistics (excluding the current row)
-    df["past_correct_sum"] = df.groupby("user_id")["correct"].cumsum() - df["correct"]
-    df["past_count"] = df.groupby("user_id").cumcount()
-    # past_accuracy – guard division by zero
-    df["past_accuracy"] = np.where(
-        df["past_count"] > 0, df["past_correct_sum"] / df["past_count"], 0.0
-    )
-    # Cumulative runtime mean (excluding current row)
-    df["past_runtime_sum"] = (
-        df.groupby("user_id")["runtime_ms"].cumsum() - df["runtime_ms"]
-    )
-    df["avg_runtime_ms"] = np.where(
-        df["past_count"] > 0, df["past_runtime_sum"] / df["past_count"], 0.0
-    )
-
-    # The feature we already have: current difficulty tier (integer)
-    df["current_difficulty"] = df["difficulty_id"]
-
-    # Target: next difficulty tier (shifted per student)
-    df["next_difficulty"] = df.groupby("user_id")["difficulty_id"].shift(-1)
-    # Drop rows where the target is missing (last submission of each student)
-    df = df.dropna(subset=["next_difficulty"]).copy()
-    df["next_difficulty"] = df["next_difficulty"].astype(int)
-
-    # Final feature matrix columns
-    feature_cols = ["past_accuracy", "avg_runtime_ms", "current_difficulty"]
-    X = df[feature_cols]
-    y = df["next_difficulty"]
-    return X, y
-
-
+# ---------------------------------------------------------------------------
+# Model training / evaluation
+# ---------------------------------------------------------------------------
 def evaluate(y_true: np.ndarray, y_pred: np.ndarray, y_proba: np.ndarray) -> None:
-    """Print evaluation metrics.
-
-    ``y_proba`` is expected to be the probability matrix of shape ``(n_samples,
-    n_classes)``.
-    """
     acc = accuracy_score(y_true, y_pred)
     prec = precision_score(y_true, y_pred, average="macro", zero_division=0)
     f1 = f1_score(y_true, y_pred, average="macro", zero_division=0)
-    # For multi‑class ROC‑AUC we use One‑vs‑Rest binarisation
-    lb = LabelBinarizer()
-    lb.fit(y_true)
-    y_true_bin = lb.transform(y_true)
+    # AUC for multi‑class (One‑vs‑Rest)
+    y_bin = label_binarize(y_true, classes=[1, 2, 3])
     try:
-        auc = roc_auc_score(y_true_bin, y_proba, average="macro", multi_class="ovr")
-    except ValueError:
+        auc = roc_auc_score(y_bin, y_proba, average="macro", multi_class="ovr")
+    except Exception:
         auc = float("nan")
     print("--- Evaluation Metrics ---")
     print(f"Accuracy   : {acc:.4f}")
@@ -301,45 +120,29 @@ def evaluate(y_true: np.ndarray, y_pred: np.ndarray, y_proba: np.ndarray) -> Non
     print(f"F1‑Score   : {f1:.4f}")
     print(f"AUC (OVR)  : {auc:.4f}")
 
-
 def main() -> None:
-    print("Loading Project CodeNet dataset …")
-    df = load_codenet()
-    print(f"Dataset rows loaded: {len(df)}")
+    print("Generating synthetic dataset …")
+    df = generate_synthetic_data()
+    X = df[["past_accuracy", "avg_runtime_ms", "current_difficulty"]]
+    y = df["next_optimal_difficulty"]
 
-    print("Pre‑processing …")
-    X, y = preprocess(df)
-    print(f"Feature matrix shape: {X.shape}")
-
-    # Train / test split (70/30) – stratified to keep class balance
     X_train, X_test, y_train, y_test = train_test_split(
-        X,
-        y,
-        test_size=0.30,
-        random_state=RANDOM_STATE,
-        stratify=y,
+        X, y, test_size=0.3, random_state=RANDOM_STATE, stratify=y
     )
 
-    print("Training Random Forest …")
+    print("Training RandomForest …")
     clf = RandomForestClassifier(
-        n_estimators=200,
-        max_depth=None,
-        random_state=RANDOM_STATE,
-        n_jobs=-1,
+        n_estimators=200, random_state=RANDOM_STATE, n_jobs=-1
     )
     clf.fit(X_train, y_train)
 
-    # Predictions
     y_pred = clf.predict(X_test)
     y_proba = clf.predict_proba(X_test)
-
     evaluate(y_test.values, y_pred, y_proba)
 
-    # Persist the model
     print(f"Saving model to {MODEL_PATH}")
     joblib.dump(clf, MODEL_PATH)
     print("Done.")
-
 
 if __name__ == "__main__":
     main()
