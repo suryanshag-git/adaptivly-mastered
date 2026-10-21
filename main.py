@@ -1,81 +1,47 @@
 #!/usr/bin/env python3
-"""main.py – FastAPI gateway for the Adaptive Difficulty model.
+"""main.py
 
-* Loads `adaptive_model.pkl` (trained by `train_knowledge_tracing.py`).
-* Exposes POST /predict that receives telemetry and returns a recommended
-  difficulty tier (1 = Easy, 2 = Medium, 3 = Hard).
+FastAPI gateway exposing the adaptive difficulty model trained in
+`train_knowledge_tracing.py`. It loads `adaptive_model.pkl` on startup and
+provides a single `POST /predict` endpoint.
 """
 
 from pathlib import Path
-from typing import Literal
+from typing import TypedDict
 
 import joblib
-import uvicorn
+import numpy as np
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field, conint, confloat
+from pydantic import BaseModel, Field
 
-# ---------------------------------------------------------------------------
-# Load the pre‑trained RandomForest model (created by train_knowledge_tracing)
-# ---------------------------------------------------------------------------
+# Load the pre‑trained model (created by train_knowledge_tracing.py)
 MODEL_PATH = Path(__file__).with_name("adaptive_model.pkl")
 if not MODEL_PATH.is_file():
-    raise FileNotFoundError(f"Model file not found at {MODEL_PATH}")
+    raise FileNotFoundError(f"Model file not found at {MODEL_PATH}. Run train_knowledge_tracing.py first.")
+model = joblib.load(MODEL_PATH)
 
-model = joblib.load(MODEL_PATH)  # type: ignore[arg-type]
-
-# ---------------------------------------------------------------------------
-# FastAPI app and request schema
-# ---------------------------------------------------------------------------
-app = FastAPI(
-    title="Adaptive Difficulty Gateway",
-    description="Predicts the next difficulty tier for a programming student.",
-    version="0.1.0",
-)
-
+app = FastAPI(title="Adaptivly Adaptive Difficulty Service", version="0.1")
 
 class Telemetry(BaseModel):
-    """Incoming payload from the backend.
+    past_accuracy: float = Field(..., ge=0.0, le=1.0, description="Proportion of correct past submissions")
+    avg_runtime_ms: float = Field(..., gt=0, description="Average runtime of past submissions in milliseconds")
+    current_difficulty: int = Field(..., ge=1, le=3, description="Current difficulty tier (1=Easy, 2=Medium, 3=Hard)")
 
-    - ``past_accuracy``: proportion of correct past submissions (0‑1)
-    - ``avg_runtime_ms``: average runtime in milliseconds
-    - ``current_difficulty``: encoded as 0=Easy, 1=Medium, 2=Hard
-    """
-
-    past_accuracy: confloat(ge=0.0, le=1.0) = Field(
-        ..., description="Proportion of past correct submissions"
-    )
-    avg_runtime_ms: confloat(ge=0.0) = Field(
-        ..., description="Average runtime of previous submissions (ms)"
-    )
-    current_difficulty: conint(ge=0, le=2) = Field(
-        ..., description="Current difficulty tier (0‑2)"
-    )
-
-
-class PredictionResponse(BaseModel):
-    """Returned JSON format containing the recommendation."""
-
-    recommended_difficulty: Literal[1, 2, 3] = Field(
-        ..., description="1=Easy, 2=Medium, 3=Hard"
-    )
-
+class PredictionResponse(TypedDict):
+    recommended_difficulty: int
 
 @app.post("/predict", response_model=PredictionResponse)
-def predict(payload: Telemetry) -> PredictionResponse:
-    """Run the RandomForest model and map its class (0‑2) to 1‑3.
+def predict(telemetry: Telemetry):
+    # Prepare feature array – the model expects the same column order as training
+    X = np.array([
+        telemetry.past_accuracy,
+        telemetry.avg_runtime_ms,
+        telemetry.current_difficulty,
+    ]).reshape(1, -1)
 
-    The model was trained with the feature order:
-        [past_accuracy, avg_runtime_ms, current_difficulty]
-    """
-    X = [[payload.past_accuracy, payload.avg_runtime_ms, payload.current_difficulty]]
     try:
-        pred_class = model.predict(X)[0]  # 0,1,2
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-    # Convert 0‑2 → 1‑3 for the external API contract
-    recommended = int(pred_class) + 1
-    return PredictionResponse(recommended_difficulty=recommended)
+        pred = model.predict(X)[0]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    return {"recommended_difficulty": int(pred)}
